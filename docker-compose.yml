@@ -1,0 +1,44 @@
+name: echarts-lab
+
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-echarts_lab}
+      POSTGRES_USER: ${POSTGRES_USER:-echarts}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-echarts_pw}
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-echarts} -d ${POSTGRES_DB:-echarts_lab}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  backend:
+    build:
+      context: ./backend
+    environment:
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-echarts}:${POSTGRES_PASSWORD:-echarts_pw}@db:5432/${POSTGRES_DB:-echarts_lab}
+      JWT_SECRET: ${JWT_SECRET:-change_me_in_production}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-admin123}
+      TEMPLATES_ROOT: /templates
+    volumes:
+      - "D:/文件夹/绘图/图像代码数据汇总:/templates"
+      - "./backend/app:/app/app"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  web:
+    build:
+      context: .
+      dockerfile: ./web/Dockerfile
+    ports:
+      - "8080:80"
+    depends_on:
+      - backend
+
+volumes:
+  db_data:
