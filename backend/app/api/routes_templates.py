@@ -538,14 +538,22 @@ def run_template(request: RunRequest):
         if request.data_files:
             for name, content in request.data_files.items():
                 ext = os.path.splitext(name)[1].lower()
-                # 对于 Excel 文件：不要用文本覆盖模板目录中已有的二进制 .xlsx/.xls
+                # Excel文件需要以二进制方式写入
                 if ext in ['.xlsx', '.xls']:
-                    continue
-                ext = os.path.splitext(name)[1].lower()
-                if ext in ('.xlsx', '.xls'):
-                    # 对于模板自带的 Excel 文件：运行时会从模板目录复制到临时目录，因此无需写入
-                    continue
-                if content and not content.startswith('['):
+                    # 如果content是base64编码的字符串，需要解码
+                    if content and isinstance(content, str):
+                        if content.startswith('['):
+                            # 是JSON数组格式，跳过
+                            continue
+                        try:
+                            import base64
+                            binary_content = base64.b64decode(content)
+                            with open(os.path.join(tmpdir, name), 'wb') as f:
+                                f.write(binary_content)
+                        except Exception:
+                            # 如果解码失败，可能是文本内容，跳过
+                            pass
+                elif content and not content.startswith('['):
                     with open(os.path.join(tmpdir, name), 'w', encoding='utf-8') as f:
                         f.write(content)
         
