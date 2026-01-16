@@ -28,6 +28,13 @@ const emit = defineEmits<{
 
 const template = ref<TemplateDetail | null>(null)
 const loading = ref(false)
+
+// 计算属性：判批 3D 曲面图或 Matplotlib 模板是否需要隐藏右侧一栋
+const is3DTemplate = computed(() => {
+  if (!template.value) return false
+  return template.value.id.includes('3D曲面图') || 
+         template.value.category === '多曲线'
+})
 const error = ref('')
 
 const code = ref('')
@@ -273,7 +280,7 @@ watch(() => props.templateId, fetchTemplate, { immediate: true })
       </div>
 
       <!-- 右侧：结果预览 -->
-      <div class="result-section">
+      <div v-if="!is3DTemplate" class="result-section">
         <div class="section-header">
           <span>生成结果</span>
           <button 
