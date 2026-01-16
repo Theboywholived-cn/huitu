@@ -536,26 +536,26 @@ def run_template(request: RunRequest):
         
         # 如果有自定义数据文件内容，写入临时目录
         if request.data_files:
-            for name, content in request.data_files.items():
-                ext = os.path.splitext(name)[1].lower()
-                # Excel文件需要以二进制方式写入
-                if ext in ['.xlsx', '.xls']:
-                    # 如果content是base64编码的字符串，需要解码
-                    if content and isinstance(content, str):
-                        if content.startswith('['):
-                            # 是JSON数组格式，跳过
-                            continue
-                        try:
-                            import base64
-                            binary_content = base64.b64decode(content)
-                            with open(os.path.join(tmpdir, name), 'wb') as f:
-                                f.write(binary_content)
-                        except Exception:
-                            # 如果解码失败，可能是文本内容，跳过
-                            pass
-                elif content and not content.startswith('['):
-                    with open(os.path.join(tmpdir, name), 'w', encoding='utf-8') as f:
-                        f.write(content)
+            for name, content_b64 in request.data_files.items():
+                try:
+                    # 1. 解码 Base64
+                    if "," in content_b64:
+                        content_b64 = content_b64.split(",")[1]
+                    file_content = base64.b64decode(content_b64)
+                    
+                    # 2. 获取文件路径
+                    file_path = os.path.join(tmpdir, name)
+                    
+                    # --- [修改点]：削除了之前的 .xlsx 检查，允许覆盖任何文件 ---
+                    # 直接写入二进制内容
+                    with open(file_path, 'wb') as f:
+                        f.write(file_content)
+                    print(f"已写入文件: {name}, 大小: {len(file_content)} bytes")
+                    
+                except Exception as e:
+                    print(f"写入文件 {name} 失败: {e}")
+                    # 继续处理其他文件，不要直接崩溃
+                    continue
         
         # 准备执行代码
         output_path = os.path.join(tmpdir, 'output.png')

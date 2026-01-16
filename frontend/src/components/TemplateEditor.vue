@@ -321,7 +321,7 @@ watch(() => props.templateId, fetchTemplate, { immediate: true })
     </div>
 
     <!-- 参数配置弹窗 -->
-    <div v-if="showConfigModal" class="modal-overlay" @click.self="showConfigModal = false">
+    <div v-if="showConfigModal && !is3DTemplate" class="modal-overlay" @click.self="showConfigModal = false">
       <div class="config-modal">
         <div class="modal-header">
           <h3>⚙️ 运行配置</h3>
