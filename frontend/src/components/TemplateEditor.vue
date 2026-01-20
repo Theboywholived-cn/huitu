@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, watch, onBeforeUnmount } from 'vue'
+import { ref, watch, onBeforeUnmount, computed } from 'vue'
 import api from '../api'
 import * as monaco from 'monaco-editor'
 
@@ -330,7 +330,7 @@ watch(() => props.templateId, fetchTemplate, { immediate: true })
         
         <div class="modal-body">
           <!-- 数据文件配置 -->
-          <div v-if="template?.data_files.length" class="config-section">
+          <div v-if="template?.data_files.length && !is3DTemplate" class="config-section">
             <h4>📊 数据文件</h4>
             <p class="section-desc">您可以使用模板自带的数据，或上传自己的数据文件</p>
             
@@ -378,13 +378,13 @@ watch(() => props.templateId, fetchTemplate, { immediate: true })
           </div>
           
           <!-- 无数据文件时的提示 -->
-          <div v-else class="config-section">
+          <div v-else-if="!is3DTemplate" class="config-section">
             <h4>📝 运行说明</h4>
             <p class="section-desc">此模板不需要外部数据文件，点击"确认运行"直接执行代码。</p>
           </div>
           
           <!-- 代码参数提示 -->
-          <div class="config-section">
+          <div v-if="!is3DTemplate" class="config-section">
             <h4>💡 提示</h4>
             <ul class="tips-list">
               <li>您可以在左侧代码编辑器中修改参数（如颜色、标题等）</li>

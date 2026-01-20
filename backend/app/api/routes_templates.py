@@ -5,6 +5,7 @@ import tempfile
 import base64
 import uuid
 import shutil
+from pathlib import Path
 from typing import List, Optional, Dict
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form
 from fastapi.responses import FileResponse, Response
@@ -536,6 +537,7 @@ def run_template(request: RunRequest):
         
         # 如果有自定义数据文件内容，写入临时目录
         if request.data_files:
+            temp_dir = Path(tmpdir)
             for name, content_b64 in request.data_files.items():
                 try:
                     # 1. 解码 Base64
@@ -543,18 +545,13 @@ def run_template(request: RunRequest):
                         content_b64 = content_b64.split(",")[1]
                     file_content = base64.b64decode(content_b64)
                     
-                    # 2. 获取文件路径
-                    file_path = os.path.join(tmpdir, name)
-                    
-                    # --- [修改点]：削除了之前的 .xlsx 检查，允许覆盖任何文件 ---
-                    # 直接写入二进制内容
-                    with open(file_path, 'wb') as f:
-                        f.write(file_content)
-                    print(f"已写入文件: {name}, 大小: {len(file_content)} bytes")
+                    # 2. FORCE WRITE - 删除任何Excel限制检查
+                    file_path = temp_dir / name
+                    file_path.write_bytes(file_content)
+                    print(f"[DEBUG] Wrote file: {name}, Size: {len(file_content)}")
                     
                 except Exception as e:
-                    print(f"写入文件 {name} 失败: {e}")
-                    # 继续处理其他文件，不要直接崩溃
+                    print(f"Error writing {name}: {e}")
                     continue
         
         # 准备执行代码
