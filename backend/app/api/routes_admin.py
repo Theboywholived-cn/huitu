@@ -99,10 +99,29 @@ def get_user_role(user: User) -> str:
     return "viewer"
 
 
+def get_template_description(name: str, code: str) -> str:
+    """Extract description from template name or code docstring"""
+    # Try to extract docstring from code
+    if code:
+        import re
+        # Match module-level docstring
+        match = re.match(r'^\s*["\'][\'"]{2}(.*?)["\'][\'"]{2}', code, re.DOTALL)
+        if match:
+            desc = match.group(1).strip()
+            if desc:
+                return desc[:200]
+        # Match # comment at the start
+        lines = code.split('\n')
+        for line in lines[:5]:
+            if line.strip().startswith('#') and not line.strip().startswith('#!'):
+                desc = line.strip()[1:].strip()
+                if desc and len(desc) > 5:
+                    return desc[:200]
+    return f"{name}模板"
+
+
 def scan_templates_for_admin() -> List[TemplateOut]:
     """Scan templates directory and return template info list"""
-    from app.api.routes_templates import get_template_description
-    
     templates = []
     templates_path = settings.TEMPLATES_PATH
     

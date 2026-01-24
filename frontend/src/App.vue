@@ -4,15 +4,25 @@ import api, { getToken, setToken } from './api'
 import type { User } from './types'
 import LoginView from './components/LoginView.vue'
 import TemplatesGallery from './components/TemplatesGallery.vue'
-import ChartConfigurator from './components/ChartConfigurator.vue'
+import ChartEditor from './components/ChartEditor.vue'
 import AdminPanel from './components/AdminPanel.vue'
+
+interface TemplateMeta {
+  id: string
+  name: string
+  category: string
+  tags: string[]
+  rel_dir: string
+  rel_main: string
+  thumbnail?: string
+}
 
 const user = ref<User | null>(null)
 const loadingMe = ref(false)
 
-// 页面模式：'templates' = 模板库, 'template-edit' = 图表配置器, 'admin' = 管理员面板
+// 页面模式：'templates' = 模板库, 'template-edit' = 图表编辑器, 'admin' = 管理员面板
 const pageMode = ref<'templates' | 'template-edit' | 'admin'>('templates')
-const activeTemplateId = ref<string | null>(null)
+const activeTemplate = ref<TemplateMeta | null>(null)
 
 const isAdmin = computed(() => user.value?.is_admin || user.value?.role === 'admin')
 
@@ -34,16 +44,16 @@ function logout() {
   setToken(null)
   user.value = null
   pageMode.value = 'templates'
-  activeTemplateId.value = null
+  activeTemplate.value = null
 }
 
-function openTemplate(templateId: string) {
-  activeTemplateId.value = templateId
+function openTemplate(template: TemplateMeta) {
+  activeTemplate.value = template
   pageMode.value = 'template-edit'
 }
 
 function backToGallery() {
-  activeTemplateId.value = null
+  activeTemplate.value = null
   pageMode.value = 'templates'
 }
 
@@ -67,13 +77,21 @@ onMounted(fetchMe)
 <template>
   <LoginView v-if="!user" @logged-in="fetchMe" />
 
+  <div v-else-if="pageMode === 'template-edit'" class="editor-fullscreen">
+    <!-- 图表编辑器 (全屏模式) -->
+    <ChartEditor 
+      :template="activeTemplate"
+      @back="backToGallery"
+    />
+  </div>
+
   <div v-else class="app-shell">
     <div class="topbar">
       <div class="title">图表模板库</div>
       <div class="nav-tabs">
         <button 
-          :class="['nav-tab', { active: pageMode === 'templates' || pageMode === 'template-edit' }]"
-          @click="pageMode = 'templates'; activeTemplateId = null"
+          :class="['nav-tab', { active: pageMode === 'templates' }]"
+          @click="pageMode = 'templates'; activeTemplate = null"
         >
           📊 模板库
         </button>
@@ -97,13 +115,6 @@ onMounted(fetchMe)
       @select="openTemplate"
     />
 
-    <!-- 图表配置器 -->
-    <ChartConfigurator 
-      v-else-if="pageMode === 'template-edit'"
-      :template-id="activeTemplateId"
-      @back="backToGallery"
-    />
-
     <!-- 管理员面板 -->
     <AdminPanel
       v-else-if="pageMode === 'admin'"
@@ -111,3 +122,14 @@ onMounted(fetchMe)
     />
   </div>
 </template>
+
+<style scoped>
+.editor-fullscreen {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 1000;
+}
+</style>

@@ -1,679 +1,754 @@
+"""Template scan & isolated run APIs.
+
+Phase 2 (The Brain):
+- scan_templates(): recursively scan `图像代码数据汇总` and derive category/tags from folder structure
+- GET  /api/templates/list: return templates + a simple tree structure
+- POST /api/templates/run : accept uploaded CSV/Excel, execute the target template in a temp folder, return output image
+- POST /api/templates/parse-data : parse uploaded data file, return column info and preview
+- POST /api/templates/run-configured : run template with custom chart configuration
+
+Notes:
+- The templates are intended to be standardized by `scripts/standardize_templates.py` (Phase 1)
+  so that they (1) use Agg backend, (2) handle Chinese fonts, (3) auto-discover uploaded data file(s),
+  (4) save to output.png.
+"""
+
+from __future__ import annotations
+
+import io
+import json
 import os
-import re
-import subprocess
-import tempfile
-import base64
-import uuid
 import shutil
+import subprocess
+import sys
+import tempfile
 from pathlib import Path
-from typing import List, Optional, Dict
-from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form
+from typing import Any, Dict, List, Optional
+
+import pandas as pd
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
-from app.api.deps import get_current_user, get_current_user_optional
-from app.db.models import User
+
+from app.api.deps import get_current_user_optional
 from app.core.config import settings
+from app.db.models import User
+
 
 router = APIRouter(prefix="/templates", tags=["templates"])
 
-# 存储生成的图片
-generated_images: Dict[str, bytes] = {}
+
+class TemplateMeta(BaseModel):
+    id: str
+    name: str
+    category: str
+    tags: List[str] = []
+    rel_dir: str
+    rel_main: str
+    thumbnail: Optional[str] = None
 
 
-def _transparent_png_bytes() -> bytes:
-    # 1x1 transparent PNG
-    return base64.b64decode(
-        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMB/6X9lWQAAAAASUVORK5CYII="
+class TemplateTreeNode(BaseModel):
+    name: str
+    path: str
+    type: str  # 'folder' | 'template'
+    children: List["TemplateTreeNode"] = []
+    template_id: Optional[str] = None
+
+
+TemplateTreeNode.model_rebuild()
+
+
+class TemplatesListResponse(BaseModel):
+    root: str
+    templates: List[TemplateMeta]
+    tree: TemplateTreeNode
+
+
+def _templates_root() -> Path:
+    return Path(settings.TEMPLATES_PATH).resolve()
+
+
+def _safe_path_under_root(rel: str) -> Path:
+    root = _templates_root()
+    candidate = (root / rel).resolve()
+    if root not in candidate.parents and candidate != root:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return candidate
+
+
+def _find_thumbnail(template_dir: Path, root: Path) -> Optional[str]:
+    """Best-effort thumbnail discovery; returned as posix relative path."""
+    # Prefer: 图片实例/*.(png|jpg)
+    img_exts = {".png", ".jpg", ".jpeg", ".gif", ".bmp"}
+    preferred_dirs = [template_dir / "图片实例", template_dir]
+
+    for d in preferred_dirs:
+        if not d.exists() or not d.is_dir():
+            continue
+        for p in sorted(d.iterdir()):
+            if p.is_file() and p.suffix.lower() in img_exts:
+                return p.relative_to(root).as_posix()
+
+    # Fallback: recursive search (first match)
+    for p in template_dir.rglob("*"):
+        if p.is_file() and p.suffix.lower() in img_exts:
+            return p.relative_to(root).as_posix()
+
+    return None
+
+
+def scan_templates() -> List[TemplateMeta]:
+    """Recursively scan templates root for any folder containing main.py."""
+    root = _templates_root()
+    if not root.exists():
+        return []
+
+    templates: List[TemplateMeta] = []
+
+    for main_py in root.rglob("main.py"):
+        if not main_py.is_file():
+            continue
+        # Skip hidden folders
+        if any(part.startswith(".") for part in main_py.relative_to(root).parts):
+            continue
+
+        rel_main = main_py.relative_to(root).as_posix()
+        rel_dir = main_py.parent.relative_to(root).as_posix()
+        parts = list(main_py.parent.relative_to(root).parts)
+
+        # Folder-structure -> category/tags
+        category = parts[0] if parts else "未分类"
+        name = parts[-1] if parts else "root"
+        tags = parts[1:-1] if len(parts) >= 3 else []
+
+        templates.append(
+            TemplateMeta(
+                id=rel_main,
+                name=name,
+                category=category,
+                tags=tags,
+                rel_dir=rel_dir,
+                rel_main=rel_main,
+                thumbnail=_find_thumbnail(main_py.parent, root),
+            )
+        )
+
+    # stable ordering: category/path
+    templates.sort(key=lambda t: (t.category, t.rel_dir, t.name))
+    return templates
+
+
+def _build_tree(templates: List[TemplateMeta]) -> TemplateTreeNode:
+    root_node = TemplateTreeNode(name="图像代码数据汇总", path="", type="folder", children=[])
+
+    # A simple trie by folder segments
+    def find_or_create_child(parent: TemplateTreeNode, name: str, path: str) -> TemplateTreeNode:
+        for c in parent.children:
+            if c.type == "folder" and c.name == name:
+                return c
+        node = TemplateTreeNode(name=name, path=path, type="folder", children=[])
+        parent.children.append(node)
+        parent.children.sort(key=lambda n: (n.type != "folder", n.name))
+        return node
+
+    for t in templates:
+        segs = [s for s in t.rel_dir.split("/") if s]
+        parent = root_node
+        current_path = ""
+        for s in segs:
+            current_path = f"{current_path}/{s}".lstrip("/")
+            parent = find_or_create_child(parent, s, current_path)
+
+        # Add template leaf
+        parent.children.append(
+            TemplateTreeNode(
+                name=t.name,
+                path=t.rel_dir,
+                type="template",
+                children=[],
+                template_id=t.id,
+            )
+        )
+        parent.children.sort(key=lambda n: (n.type != "folder", n.name))
+
+    return root_node
+
+
+@router.get("/list", response_model=TemplatesListResponse)
+def list_templates_structured(current_user: Optional[User] = Depends(get_current_user_optional)):
+    templates = scan_templates()
+    root = _templates_root()
+    return TemplatesListResponse(
+        root=str(root),
+        templates=templates,
+        tree=_build_tree(templates),
     )
 
 
-class TemplateInfo(BaseModel):
-    id: str
-    name: str
-    category: str
-    description: str
-    thumbnail: Optional[str] = None
-    has_data_file: bool = False
-    data_files: List[str] = []
+# Backward-compatible alias for existing UI: GET /api/templates
+@router.get("", response_model=List[TemplateMeta])
+def list_templates_flat(current_user: Optional[User] = Depends(get_current_user_optional)):
+    return scan_templates()
 
 
-class DataFileInfo(BaseModel):
-    name: str
-    content: str
-    path: str
-
-
-class TemplateDetail(BaseModel):
-    id: str
-    name: str
-    category: str
-    code: str
-    data_files: List[DataFileInfo] = []
-    description: str
-
-
-class RunRequest(BaseModel):
-    code: str
-    template_id: Optional[str] = None
-    data_files: Optional[Dict[str, str]] = None
-
-
-class RunResponse(BaseModel):
-    success: bool
-    image_base64: Optional[str] = None
-    image_id: Optional[str] = None
-    error: Optional[str] = None
-    output: Optional[str] = None
-
-
-def get_template_description(name: str, code: str = "") -> str:
-    """Generate description from template name or code"""
-    # 尝试从代码注释中提取描述
-    if code:
-        lines = code.split('\n')[:10]
-        for line in lines:
-            if line.strip().startswith('#') and len(line.strip()) > 5:
-                desc = line.strip().lstrip('#').strip()
-                if len(desc) > 5 and not desc.startswith('coding') and not desc.startswith('-*-'):
-                    return desc[:100]
-    
-    # 根据名称生成描述
-    name_clean = name.replace('.py', '').replace('_', ' ')
-    return f"{name_clean} 绘图示例"
-
-
-def scan_templates() -> List[TemplateInfo]:
-    """Scan templates directory and return template info list
-    
-    新目录结构：
-    图像代码数据汇总/
-    ├── taylor/
-    │   ├── 泰勒图示例/
-    │   │   ├── main.py
-    │   │   └── ...
-    ├── scatter_cmap/
-    │   ├── 模板1/
-    │   │   ├── main.py
-    │   │   └── ...
-    ├── bar/
-    ├── violin/
-    └── ...
-    """
-    templates = []
-    templates_path = settings.TEMPLATES_PATH
-    
-    # 调试日志
-    import sys
-    print(f"[DEBUG] TEMPLATES_PATH: {templates_path}", file=sys.stderr)
-    print(f"[DEBUG] Path exists: {os.path.exists(templates_path)}", file=sys.stderr)
-    
-    if not os.path.exists(templates_path):
-        return templates
-    
-    # 第一层：遍历图表类型目录（taylor, scatter_cmap, bar 等）
-    for chart_type in os.listdir(templates_path):
-        chart_type_path = os.path.join(templates_path, chart_type)
-        
-        # 跳过非目录、隐藏目录、脚本
-        if not os.path.isdir(chart_type_path) or chart_type.startswith('.'):
-            continue
-        
-        # 第二层：遍历每个图表类型下的模板目录
-        for template_name in os.listdir(chart_type_path):
-            template_dir = os.path.join(chart_type_path, template_name)
-            
-            if not os.path.isdir(template_dir):
-                continue
-            
-            # 查找该模板目录下的 main.py（迁移脚本生成的标准文件）
-            main_py_path = os.path.join(template_dir, 'main.py')
-            
-            if not os.path.exists(main_py_path):
-                # 如果没有 main.py，尝试查找任何 .py 文件（兼容旧结构）
-                py_files = [f for f in os.listdir(template_dir) 
-                           if f.endswith('.py') and not f.startswith('__')]
-                if not py_files:
-                    continue
-                # 选择名称最长的（通常最具描述性）
-                main_py_path = os.path.join(template_dir, max(py_files, key=len))
-            
-            # 读取代码
-            try:
-                with open(main_py_path, 'r', encoding='utf-8') as f:
-                    code = f.read()
-            except Exception as e:
-                print(f"[WARN] Failed to read {main_py_path}: {e}", file=sys.stderr)
-                code = ""
-            
-            # 为该模板目录确保存在示范数据 Excel
-            try:
-                _ensure_demo_excel(template_dir, template_name, code)
-            except Exception as e:
-                print(f"[WARN] Failed to ensure demo excel for {template_dir}: {e}", file=sys.stderr)
-            
-            # 查找同目录下的数据文件
-            data_files = []
-            for df in os.listdir(template_dir):
-                if df.endswith(('.csv', '.xlsx', '.xls')):
-                    data_files.append(df)
-            
-            # 检查是否有缩略图
-            thumbnail_rel = None
-            
-            # 1. 首先检查"图片实例"子文件夹
-            thumb_dir = os.path.join(template_dir, '图片实例')
-            if os.path.exists(thumb_dir):
-                for img in os.listdir(thumb_dir):
-                    if img.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp')):
-                        thumb_path = os.path.join(thumb_dir, img)
-                        thumbnail_rel = os.path.relpath(thumb_path, templates_path)
-                        break
-            
-            # 2. 检查同级目录下的图片
-            if not thumbnail_rel:
-                for img in os.listdir(template_dir):
-                    if img.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp')):
-                        thumb_path = os.path.join(template_dir, img)
-                        thumbnail_rel = os.path.relpath(thumb_path, templates_path)
-                        break
-            
-            # 3. 递归检查子目录
-            if not thumbnail_rel:
-                for sub_root, sub_dirs, sub_files in os.walk(template_dir):
-                    for img in sub_files:
-                        if img.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp')):
-                            thumb_path = os.path.join(sub_root, img)
-                            thumbnail_rel = os.path.relpath(thumb_path, templates_path)
-                            break
-                    if thumbnail_rel:
-                        break
-            
-            # 构建返回信息
-            rel_path = os.path.relpath(main_py_path, templates_path)
-            templates.append(TemplateInfo(
-                id=rel_path,
-                name=template_name,
-                category=chart_type,  # 使用图表类型作为分类
-                description=get_template_description(template_name, code),
-                thumbnail=thumbnail_rel,
-                has_data_file=len(data_files) > 0,
-                data_files=data_files
-            ))
-    
-    return templates
-
-
-class ExcelParseResponse(BaseModel):
-    headers: List[str]
-    rows: List[dict]
-    row_count: int
-
-
-@router.post("/parse-excel", response_model=ExcelParseResponse)
-async def parse_excel_file(
-    file: UploadFile = File(...),
-    current_user: User = Depends(get_current_user)
-):
-    """Parse Excel file and return headers and data rows"""
-    import pandas as pd
-    import io
-    
-    if not file.filename:
-        raise HTTPException(status_code=400, detail="No file provided")
-    
-    filename = file.filename.lower()
-    if not (filename.endswith('.xlsx') or filename.endswith('.xls')):
-        raise HTTPException(status_code=400, detail="Only Excel files (.xlsx, .xls) are supported")
-    
-    try:
-        content = await file.read()
-        df = pd.read_excel(io.BytesIO(content))
-        
-        # 转换为响应格式
-        headers = df.columns.tolist()
-        rows = df.to_dict(orient='records')
-        
-        # 限制行数避免过大
-        max_rows = 1000
-        if len(rows) > max_rows:
-            rows = rows[:max_rows]
-        
-        return ExcelParseResponse(
-            headers=headers,
-            rows=rows,
-            row_count=len(df)
-        )
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to parse Excel: {str(e)}")
-
-
-
-def _ensure_demo_excel(template_dir: str, template_name: str, code_text: str) -> str | None:
-    # Ensure each template directory has a demo Excel file (for UI selection and plotting).
-    # Returns demo filename if exists/created, else None.
-    demo_filename = '示范数据.xlsx'
-    demo_path = os.path.join(template_dir, demo_filename)
-    if os.path.exists(demo_path):
-        return demo_filename
-
-    try:
-        import pandas as pd
-        import numpy as np
-
-        name = (template_name or '')
-        name_lower = name.lower()
-        code_lower = (code_text or '').lower()
-
-        # Taylor diagram demo
-        if ('taylor' in code_lower) or ('泰勒' in name) or ('图7-4-2' in name):
-            df = pd.DataFrame({
-                '模型': ['PIR','NDIR','DIR','RIR','RIE','PIE','NDIE','DIE'],
-                '相关系数': [0.95, 0.90, 0.88, 0.80, 0.70, 0.86, 0.84, 0.83],
-                '标准差': [2.3, 2.4, 2.35, 2.1, 2.0, 2.6, 2.7, 3.2],
-                '均方根误差': [1.55, 1.70, 1.72, 1.90, 2.00, 1.75, 1.78, 1.60],
-            })
-        # Scatter-compare demo (paired columns *_0, *_1)
-        elif ('散点' in name) or ('对比' in name) or ('scatter' in name_lower) or ('compare' in name_lower):
-            models = []
-            for m in ['XGBoost','FCN','LSTM','CNN_LSTM','CNN-LSTM','CNNLSTM']:
-                if m.lower() in name_lower:
-                    models.append(m.replace('-', '_'))
-            if not models:
-                models = ['ModelA','ModelB','ModelC','ModelD']
-            n = 200
-            x = np.linspace(0, 100, n)
-            data = {}
-            for i, m in enumerate(models[:6]):
-                # _0 as "True", _1 as "Pred"
-                noise = (i + 1) * 2.0
-                data[f'{m}_0'] = x
-                data[f'{m}_1'] = x + np.sin(x/8.0) * noise
-            df = pd.DataFrame(data)
-        else:
-            # Generic demo: 3 pairs
-            n = 120
-            x = np.linspace(0, 1, n)
-            df = pd.DataFrame({
-                'A_0': x * 100,
-                'A_1': x * 100 + np.cos(x * 6) * 2,
-                'B_0': x * 80,
-                'B_1': x * 80 + np.sin(x * 5) * 3,
-                'C_0': x * 60,
-                'C_1': x * 60 + np.cos(x * 4) * 4,
-            })
-
-        df.to_excel(demo_path, index=False)
-        return demo_filename
-    except Exception:
-        return None
-
-@router.get("", response_model=List[TemplateInfo])
-def list_templates(current_user: Optional[User] = Depends(get_current_user_optional)):
-    """List all available templates (no auth required)"""
-    templates = scan_templates()
-    
-    # 如果扫描不到模板，手动扫描一次（修复路径问题）
-    if not templates:
-        import os
-        # 尝试多个可能的路径
-        possible_paths = [
-            r"D:\文件夹\绘图\图像代码数据汇总",
-            os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "图像代码数据汇总"),
-            "图像代码数据汇总"
-        ]
-        
-        for path in possible_paths:
-            if os.path.exists(path):
-                # 临时修改settings
-                settings.TEMPLATES_ROOT = path
-                templates = scan_templates()
-                if templates:
-                    break
-    
-    return templates
-
-
-# 静态图片访问端点 - 无需认证，允许 <img> 标签直接访问
-# 必须在 /{template_id:path} 之前定义
+# Static image endpoint for thumbnails - must be before dynamic routes
 @router.get("/image/{image_path:path}")
 def get_template_image(image_path: str):
     """Get any image from templates directory (public access for thumbnails)"""
-    templates_path = settings.TEMPLATES_PATH
-    file_path = os.path.join(templates_path, image_path)
+    root = _templates_root()
+    file_path = root / image_path
     
-    # 安全检查 - 防止路径遍历攻击
-    real_path = os.path.realpath(file_path)
-    templates_real = os.path.realpath(templates_path)
-    if not real_path.startswith(templates_real):
-        raise HTTPException(status_code=403, detail="Access denied")
+    # Security check - prevent path traversal
+    try:
+        file_path = file_path.resolve()
+        if root not in file_path.parents and file_path != root:
+            raise HTTPException(status_code=403, detail="Access denied")
+    except Exception:
+        raise HTTPException(status_code=403, detail="Invalid path")
     
-    if not os.path.exists(file_path):
+    if not file_path.exists() or not file_path.is_file():
         raise HTTPException(status_code=404, detail="Image not found")
     
-    # 检查是否是图片文件
-    if not file_path.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp')):
+    # Check if it's an image file
+    if file_path.suffix.lower() not in {".png", ".jpg", ".jpeg", ".gif", ".bmp"}:
         raise HTTPException(status_code=400, detail="Not an image file")
     
     return FileResponse(file_path)
 
 
-@router.get("/{template_id:path}/thumbnail")
-def get_template_thumbnail(template_id: str):
-    """Get template thumbnail image (public access)"""
-    templates_path = settings.TEMPLATES_PATH
-    file_path = os.path.join(templates_path, template_id)
-    
-    # 安全检查
-    real_path = os.path.realpath(file_path)
-    templates_real = os.path.realpath(templates_path)
-    if not real_path.startswith(templates_real):
-        raise HTTPException(status_code=403, detail="Access denied")
-    
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="Template not found")
-    
-    # 查找缩略图
-    parent_dir = os.path.dirname(file_path)
-    
-    # 1. 首先检查"图片实例"子文件夹
-    thumb_dir = os.path.join(parent_dir, '图片实例')
-    if os.path.exists(thumb_dir):
-        for img in os.listdir(thumb_dir):
-            if img.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp')):
-                return FileResponse(os.path.join(thumb_dir, img))
-    
-    # 2. 检查同级目录下的图片
-    for img in os.listdir(parent_dir):
-        if img.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp')):
-            return FileResponse(os.path.join(parent_dir, img))
-    
-    # 3. 递归检查子目录
-    for sub_root, sub_dirs, sub_files in os.walk(parent_dir):
-        for img in sub_files:
-            if img.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp')):
-                return FileResponse(os.path.join(sub_root, img))
-    
-    # 没有缩略图：返回占位图，避免前端出现破图与大量 404
-    return Response(content=_transparent_png_bytes(), media_type="image/png")
+@router.post("/run")
+async def run_template(
+    template_id: str = Form(...),
+    files: List[UploadFile] = File(...),
+    current_user: Optional[User] = Depends(get_current_user_optional),
+):
+    """Run a template in an isolated temp directory and return output.png.
 
+    - template_id: relative path to the template's main.py, as returned by /list
+    - files: one or more uploaded data files (.csv/.xlsx/.xls)
+    """
+    if not files:
+        raise HTTPException(status_code=400, detail="No data files uploaded")
 
-@router.get("/{template_id:path}", response_model=TemplateDetail)
-def get_template_detail(template_id: str, current_user: User = Depends(get_current_user)):
-    """Get template detail with code and data files"""
-    templates_path = settings.TEMPLATES_PATH
-    file_path = os.path.join(templates_path, template_id)
-    
-    # 安全检查
-    real_path = os.path.realpath(file_path)
-    templates_real = os.path.realpath(templates_path)
-    if not real_path.startswith(templates_real):
-        raise HTTPException(status_code=403, detail="Access denied")
-    
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="Template not found")
-    
-    # 读取代码
-    try:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            code = f.read()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to read template: {e}")
-    
-    # 读取数据文件
-    parent_dir = os.path.dirname(file_path)
+    allowed = {".csv", ".xlsx", ".xls"}
+    for f in files:
+        if not f.filename:
+            raise HTTPException(status_code=400, detail="Uploaded file missing filename")
+        ext = Path(f.filename).suffix.lower()
+        if ext not in allowed:
+            raise HTTPException(status_code=400, detail=f"Unsupported file type: {ext}")
 
-    # 确保每个模板目录下都有一个“示范数据.xlsx”（用于演示数据格式；可直接选取绘图）
-    try:
-        _ensure_demo_excel(parent_dir, os.path.basename(parent_dir), code)
-    except Exception:
-        pass
+    # Resolve template path safely
+    main_py = _safe_path_under_root(template_id)
+    if not main_py.exists() or not main_py.is_file() or main_py.name.lower() != "main.py":
+        raise HTTPException(status_code=404, detail="Template main.py not found")
 
-    data_files = []
+    with tempfile.TemporaryDirectory(prefix="echarts_lab_") as tmpdir:
+        tmp = Path(tmpdir)
 
-    # 说明：
-    # - 对 CSV：返回文本内容，前端可直接解析
-    # - 对 Excel：返回“预览用 CSV 文本”（由 Excel 转换），便于前端解析列
-    #   但运行时后端不会用该文本覆盖原始 .xlsx 文件（run 接口会跳过写入 .xlsx/.xls），
-    #   Python 脚本将从模板目录拷贝到临时目录的真实 Excel 读取。
-    import pandas as pd
+        # Copy main.py into isolated folder
+        shutil.copy2(main_py, tmp / "main.py")
 
-    def _append_data_file(df_name: str):
-        df_path = os.path.join(parent_dir, df_name)
-        if not os.path.isfile(df_path):
-            return
-        lower = df_name.lower()
-        if not (lower.endswith('.csv') or lower.endswith('.xlsx') or lower.endswith('.xls')):
-            return
+        # Save uploaded files into isolated folder (CWD)
+        for uf in files:
+            content = await uf.read()
+            (tmp / uf.filename).write_bytes(content)
 
-        content = ''
-        try:
-            if lower.endswith('.csv'):
-                with open(df_path, 'r', encoding='utf-8') as f:
-                    content = f.read()
-            else:
-                try:
-                    preview_df = pd.read_excel(df_path)
-                    # 限制预览行数，避免前端/接口过大
-                    content = preview_df.head(200).to_csv(index=False)
-                except Exception:
-                    content = "[Excel文件，无法预览]"
-        except Exception:
-            content = "[读取文件失败]"
+        output_path = tmp / "output.png"
 
-        data_files.append(DataFileInfo(
-            name=df_name,
-            content=content,
-            path=os.path.join(template_id.split(os.sep)[0], os.path.basename(parent_dir), df_name)
-        ))
-
-    # 让示范数据优先出现在下拉框（前端默认取第一个）
-    demo_name = '示范数据.xlsx'
-    names = []
-    try:
-        names = os.listdir(parent_dir)
-    except Exception:
-        names = []
-
-    if demo_name in names:
-        _append_data_file(demo_name)
-
-    for df_name in names:
-        if df_name == demo_name:
-            continue
-        _append_data_file(df_name)
-
-    # 获取分类和名称
-    parts = template_id.split(os.sep)
-    if len(parts) == 0:
-        parts = template_id.split('/')
-    category = parts[0] if len(parts) > 0 else "未分类"
-    template_name = os.path.basename(parent_dir)
-    if template_name == category:
-        template_name = os.path.basename(file_path).replace('.py', '')
-
-    # 为每个模板目录确保存在一个示范数据 Excel（用于下拉选择与格式演示）
-    _ensure_demo_excel(parent_dir, template_name, code)
-
-    # 重新排序：示范数据.xlsx 优先
-    try:
-        demo_first = []
-        others = []
-        for item in data_files:
-            if item.name == '示范数据.xlsx':
-                demo_first.append(item)
-            else:
-                others.append(item)
-        data_files = demo_first + others
-    except Exception:
-        pass
-
-    return TemplateDetail(
-        id=template_id,
-        name=template_name,
-        category=category,
-        code=code,
-        data_files=data_files,
-        description=get_template_description(template_name, code)
-    )
-
-
-@router.post("/run", response_model=RunResponse)
-def run_template(request: RunRequest):
-    """Execute Python code and return the generated image"""
-    import textwrap
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        # 如果有模板ID，复制数据文件到临时目录
-        if request.template_id:
-            templates_path = settings.TEMPLATES_PATH
-            template_path = os.path.join(templates_path, request.template_id)
-            if os.path.exists(template_path):
-                parent_dir = os.path.dirname(template_path)
-                for f in os.listdir(parent_dir):
-                    if f.endswith(('.csv', '.xlsx', '.xls', '.png', '.jpg')):
-                        src = os.path.join(parent_dir, f)
-                        dst = os.path.join(tmpdir, f)
-                        shutil.copy2(src, dst)
-        
-        # 如果有自定义数据文件内容，写入临时目录
-        if request.data_files:
-            temp_dir = Path(tmpdir)
-            for name, content_b64 in request.data_files.items():
-                try:
-                    # 1. 解码 Base64
-                    if "," in content_b64:
-                        content_b64 = content_b64.split(",")[1]
-                    file_content = base64.b64decode(content_b64)
-                    
-                    # 2. FORCE WRITE - 删除任何Excel限制检查
-                    file_path = temp_dir / name
-                    file_path.write_bytes(file_content)
-                    print(f"[DEBUG] Wrote file: {name}, Size: {len(file_content)}")
-                    
-                except Exception as e:
-                    print(f"Error writing {name}: {e}")
-                    continue
-        
-        # 准备执行代码
-        output_path = os.path.join(tmpdir, 'output.png')
-        
-        # 清理用户代码缩进（避免顶层意外缩进导致 IndentationError）
-        cleaned_code = textwrap.dedent(request.code or "").strip("\n")
-
-        # 包装代码
-        wrapper_code = f'''
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-import warnings
-warnings.filterwarnings('ignore')
-
-# 设置中文字体
-plt.rcParams['font.sans-serif'] = ['WenQuanYi Zen Hei', 'SimHei', 'DejaVu Sans']
-plt.rcParams['axes.unicode_minus'] = False
-
-import os
-os.chdir(r"{tmpdir}")
-
-{cleaned_code}
-
-# 保存图片
-if plt.get_fignums():
-    plt.savefig(r"{output_path}", dpi=150, bbox_inches='tight', facecolor='white')
-    plt.close('all')
-'''
-        
-        script_path = os.path.join(tmpdir, 'script.py')
-        with open(script_path, 'w', encoding='utf-8') as f:
-            f.write(wrapper_code)
-        
-        # 使用当前 Python 解释器执行脚本（确保使用同一环境的依赖）
-        import sys
-        python_executable = sys.executable
-        
-        # 准备环境变量，修复 Python 3.14 的路径问题
         env = os.environ.copy()
-        env['MPLCONFIGDIR'] = tmpdir
-        # 移除可能导致问题的环境变量
-        env.pop('PYTHONHOME', None)
-        env.pop('__PYVENV_LAUNCHER__', None)
-        
-        # 执行脚本
+        env["MPLBACKEND"] = "Agg"
+        env["MPLCONFIGDIR"] = str(tmp)
+        env["PYTHONUTF8"] = "1"
+        env.pop("PYTHONHOME", None)
+        env.pop("__PYVENV_LAUNCHER__", None)
+
         try:
-            result = subprocess.run(
-                [python_executable, script_path],
+            proc = subprocess.run(
+                [sys.executable, "main.py"],
+                cwd=str(tmp),
+                env=env,
                 capture_output=True,
                 text=True,
                 timeout=180,
-                cwd=tmpdir,
-                env=env
             )
-            
-            output = result.stdout
-            error = result.stderr if result.returncode != 0 else None
-            
-            # 检查是否生成了图片
-            if os.path.exists(output_path):
-                with open(output_path, 'rb') as f:
-                    image_data = f.read()
-                
-                image_id = str(uuid.uuid4())
-                generated_images[image_id] = image_data
-                
-                return RunResponse(
-                    success=True,
-                    image_base64=base64.b64encode(image_data).decode('utf-8'),
-                    image_id=image_id,
-                    output=output
-                )
-            else:
-                return RunResponse(
-                    success=False,
-                    error=error or "未生成图片，请检查代码是否包含 plt.show()，或是否在脚本中保存图片。",
-                    output=output
-                )
-                
         except subprocess.TimeoutExpired:
-            return RunResponse(
-                success=False,
-                error="执行超时（120秒限制）"
-            )
+            raise HTTPException(status_code=408, detail="Template execution timed out (180s)")
         except Exception as e:
-            return RunResponse(
-                success=False,
-                error=str(e)
-            )
+            raise HTTPException(status_code=500, detail=f"Failed to start template: {e}")
+
+        if proc.returncode != 0:
+            stderr = (proc.stderr or "").strip()
+            stdout = (proc.stdout or "").strip()
+            msg = stderr or stdout or "Template execution failed"
+            # Keep detail reasonably sized
+            if len(msg) > 4000:
+                msg = msg[:4000] + "..."
+            raise HTTPException(status_code=400, detail=msg)
+
+        if not output_path.exists():
+            # Fallback: find any png in temp dir
+            pngs = sorted(tmp.glob("*.png"), key=lambda p: p.stat().st_mtime, reverse=True)
+            if pngs:
+                output_path = pngs[0]
+            else:
+                raise HTTPException(
+                    status_code=400,
+                    detail="No output image produced. Expecting output.png (run Phase 1 standardizer first).",
+                )
+
+        img = output_path.read_bytes()
+        return Response(content=img, media_type="image/png")
 
 
-@router.get("/image/{image_id}")
-def get_image(image_id: str, current_user: User = Depends(get_current_user)):
-    """Get generated image by ID"""
-    if image_id not in generated_images:
-        raise HTTPException(status_code=404, detail="Image not found")
+# ============================================================================
+# Data Parsing API - parse uploaded file to get column info
+# ============================================================================
+
+class ColumnInfo(BaseModel):
+    name: str
+    dtype: str
+    sample_values: List[Any]
+    is_numeric: bool
+    unique_count: int
+
+
+class DataParseResponse(BaseModel):
+    filename: str
+    row_count: int
+    columns: List[ColumnInfo]
+    preview: List[Dict[str, Any]]  # First 10 rows
+
+
+@router.post("/parse-data", response_model=DataParseResponse)
+async def parse_data_file(
+    file: UploadFile = File(...),
+    current_user: Optional[User] = Depends(get_current_user_optional),
+):
+    """Parse uploaded data file and return column information."""
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="Missing filename")
     
-    return Response(
-        content=generated_images[image_id],
-        media_type="image/png",
-        headers={"Content-Disposition": f"attachment; filename={image_id}.png"}
+    ext = Path(file.filename).suffix.lower()
+    allowed = {".csv", ".xlsx", ".xls"}
+    if ext not in allowed:
+        raise HTTPException(status_code=400, detail=f"Unsupported file type: {ext}")
+    
+    content = await file.read()
+    
+    try:
+        if ext == ".csv":
+            # Try multiple encodings
+            for encoding in ["utf-8", "gbk", "gb2312", "latin1"]:
+                try:
+                    df = pd.read_csv(io.BytesIO(content), encoding=encoding)
+                    break
+                except UnicodeDecodeError:
+                    continue
+            else:
+                df = pd.read_csv(io.BytesIO(content), encoding="utf-8", errors="replace")
+        else:
+            df = pd.read_excel(io.BytesIO(content))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to parse file: {str(e)}")
+    
+    columns = []
+    for col in df.columns:
+        is_numeric = pd.api.types.is_numeric_dtype(df[col])
+        sample = df[col].dropna().head(5).tolist()
+        # Convert numpy types to native Python types for JSON serialization
+        sample = [float(v) if isinstance(v, (int, float)) and pd.notna(v) else str(v) for v in sample]
+        
+        columns.append(ColumnInfo(
+            name=str(col),
+            dtype=str(df[col].dtype),
+            sample_values=sample,
+            is_numeric=is_numeric,
+            unique_count=int(df[col].nunique()),
+        ))
+    
+    # Preview data (first 10 rows)
+    preview_df = df.head(10).fillna("")
+    preview = []
+    for _, row in preview_df.iterrows():
+        row_dict = {}
+        for col in df.columns:
+            val = row[col]
+            if pd.isna(val):
+                row_dict[str(col)] = ""
+            elif isinstance(val, (int, float)):
+                row_dict[str(col)] = float(val) if isinstance(val, float) else int(val)
+            else:
+                row_dict[str(col)] = str(val)
+        preview.append(row_dict)
+    
+    return DataParseResponse(
+        filename=file.filename,
+        row_count=len(df),
+        columns=columns,
+        preview=preview,
     )
 
 
-@router.post("/run-with-files", response_model=RunResponse)
-async def run_template_with_files(
-    code: str = Form(...),
-    template_id: Optional[str] = Form(None),
-    data_files_json: Optional[str] = Form(None),
-    current_user: User = Depends(get_current_user)
+# ============================================================================
+# Configured Template Run API - run with custom chart settings
+# ============================================================================
+
+class ChartConfig(BaseModel):
+    """Chart configuration for customized rendering."""
+    # Data mapping
+    x_column: Optional[str] = None
+    y_columns: Optional[List[str]] = None
+    group_column: Optional[str] = None
+    selected_pairs: Optional[List[str]] = None  # 选中的模型配对名称
+    
+    # Visual style
+    marker_style: str = "circle"  # circle, square, diamond, triangle, star
+    marker_size: int = 8
+    line_style: str = "solid"  # solid, dashed, dotted
+    line_width: float = 1.5
+    
+    # Colors (hex strings)
+    colors: Optional[List[str]] = None
+    colormap: str = "jet"
+    
+    # Layout
+    title: str = ""
+    x_label: str = ""
+    y_label: str = ""
+    show_legend: bool = True
+    show_grid: bool = True
+    
+    # Figure size
+    fig_width: float = 10.0
+    fig_height: float = 8.0
+    dpi: int = 150
+    
+    # 柱形图专属配置
+    show_points: bool = True       # 是否显示数据点
+    show_error: bool = True        # 是否显示误差线
+    error_type: str = "sd"         # 误差类型: sd, se, ci
+    bar_width: float = 0.8         # 柱子宽度
+    point_size: int = 5            # 数据点大小
+    
+    # 云雨图/小提琴图专属配置
+    raincloud_style: int = 1       # 云雨图样式 1-6
+    show_box: bool = True          # 是否显示箱线图
+    
+    # 子图模板专属配置
+    n_subplots: int = 2            # 子图数量
+    subplot_layout: str = "vertical"  # 子图布局: vertical, horizontal
+    show_colorbar: bool = True     # 显示colorbar
+    share_colorbar: bool = True    # 共享colorbar
+    
+    # 三元图专属配置
+    ternary_mode: str = "group"    # 三元图模式: group, color
+    z_label: str = "Variable 3"    # 第三个轴标签
+    
+    # 模型预测对比图专属配置
+    true_color: str = "#0000FF"    # 真实值颜色
+    pred_color: str = "#FF0000"    # 预测值颜色
+    show_metrics: bool = True      # 显示R²和MAE指标
+    invert_y: bool = True          # Y轴反向
+    
+    # 堆积柱形图专属配置
+    show_values: bool = True       # 显示数值标签
+    
+    # 相关性散点图专属配置
+    show_regression: bool = True   # 显示回归线和方程
+    show_r2: bool = True           # 显示R²值
+    show_diagonal: bool = True     # 显示1:1对角线
+    
+    # 矩阵气泡图专属配置
+    bubble_shape: str = "circle"   # 气泡形状: circle, square
+    show_size_legend: bool = True  # 显示大小图例
+    bubble_alpha: float = 0.9      # 气泡透明度
+    
+    # 泰勒图专属配置
+    show_rmsd: bool = True         # 显示RMSD等值线
+    show_labels: bool = True       # 显示数据点标签
+    use_different_markers: bool = True  # 使用不同标记区分模型
+    ref_std: float = 5.0           # 参考标准差
+    
+    # 三元密度图专属配置
+    show_scatter: bool = True      # 显示散点
+    scatter_color: str = "#1f4e79" # 散点颜色
+    colorbar_position: str = "right"  # 颜色条位置: right, bottom
+    density_sigma: float = 2.0     # 密度平滑系数
+    
+    # 通用热力图专属配置
+    heatmap_mode: str = "correlation"  # 热力图模式: correlation, matrix
+    square_cells: bool = True      # 正方形单元格
+    center_zero: bool = True       # 颜色中心为0
+    value_format: str = ".2f"      # 数值格式
+    font_size: int = 10            # 数值字体大小
+    
+    # 显著性箱线图专属配置
+    test_method: str = "mww"       # 检验方法: ttest, mww
+    show_significance: bool = True # 显示显著性标注
+    box_width: float = 0.6         # 箱子宽度
+    point_alpha: float = 0.7       # 散点透明度
+    jitter_amount: float = 0.15    # 散点抖动量
+    
+    # 通用箱线图专属配置
+    box_alpha: float = 0.8         # 箱子透明度
+    show_outliers: bool = True     # 显示异常值
+    show_notch: bool = False       # 显示缺口
+    show_means: bool = False       # 显示均值
+    median_width: float = 2.0      # 中位数线宽度
+    orient: str = "vertical"       # 方向: vertical, horizontal
+    
+    # 边际组合图/相关性矩阵图专属配置
+    matrix_style: str = "circle"   # 矩阵样式: circle, square, heatmap, values
+    display_mode: str = "full"     # 显示模式: full, lower, upper
+    grid_width: float = 1.5        # 网格线宽
+
+
+# Generate Python code for chart configuration
+def _generate_config_code(config: ChartConfig) -> str:
+    """Generate Python code that sets up chart configuration."""
+    marker_map = {
+        "circle": "o",
+        "square": "s",
+        "diamond": "D",
+        "triangle": "^",
+        "star": "*",
+        "plus": "+",
+        "x": "x",
+    }
+    
+    line_map = {
+        "solid": "-",
+        "dashed": "--",
+        "dotted": ":",
+        "dashdot": "-.",
+    }
+    
+    colors_str = "None"
+    if config.colors:
+        colors_str = repr(config.colors)
+    
+    y_cols_str = "None"
+    if config.y_columns:
+        y_cols_str = repr(config.y_columns)
+    
+    selected_pairs_str = "None"
+    if config.selected_pairs:
+        selected_pairs_str = repr(config.selected_pairs)
+    
+    code = f'''
+# ========== Chart Configuration (Auto-generated) ==========
+import json as _json
+
+class ChartConfig:
+    x_column = {repr(config.x_column)}
+    y_columns = {y_cols_str}
+    group_column = {repr(config.group_column)}
+    selected_pairs = {selected_pairs_str}
+    
+    marker_style = "{marker_map.get(config.marker_style, 'o')}"
+    marker_size = {config.marker_size}
+    line_style = "{line_map.get(config.line_style, '-')}"
+    line_width = {config.line_width}
+    
+    colors = {colors_str}
+    colormap = "{config.colormap}"
+    
+    title = {repr(config.title)}
+    x_label = {repr(config.x_label)}
+    y_label = {repr(config.y_label)}
+    show_legend = {config.show_legend}
+    show_grid = {config.show_grid}
+    
+    fig_width = {config.fig_width}
+    fig_height = {config.fig_height}
+    dpi = {config.dpi}
+    
+    # 柱形图专属配置
+    show_points = {config.show_points}
+    show_error = {config.show_error}
+    error_type = "{config.error_type}"
+    bar_width = {config.bar_width}
+    point_size = {config.point_size}
+    
+    # 云雨图/小提琴图专属配置
+    raincloud_style = {config.raincloud_style}
+    show_box = {config.show_box}
+    
+    # 子图模板专属配置
+    n_subplots = {config.n_subplots}
+    subplot_layout = "{config.subplot_layout}"
+    show_colorbar = {config.show_colorbar}
+    share_colorbar = {config.share_colorbar}
+    
+    # 三元图专属配置
+    ternary_mode = "{config.ternary_mode}"
+    z_label = {repr(config.z_label)}
+    
+    # 模型预测对比图专属配置
+    true_color = "{config.true_color}"
+    pred_color = "{config.pred_color}"
+    show_metrics = {config.show_metrics}
+    invert_y = {config.invert_y}
+    
+    # 堆积柱形图专属配置
+    show_values = {config.show_values}
+    
+    # 相关性散点图专属配置
+    show_regression = {config.show_regression}
+    show_r2 = {config.show_r2}
+    show_diagonal = {config.show_diagonal}
+    
+    # 矩阵气泡图专属配置
+    marker_style = "{config.bubble_shape}"
+    show_size_legend = {config.show_size_legend}
+    bubble_alpha = {config.bubble_alpha}
+    
+    # 泰勒图专属配置
+    show_rmsd = {config.show_rmsd}
+    show_labels = {config.show_labels}
+    use_different_markers = {config.use_different_markers}
+    ref_std = {config.ref_std}
+    
+    # 三元密度图专属配置
+    show_scatter = {config.show_scatter}
+    scatter_color = "{config.scatter_color}"
+    colorbar_position = "{config.colorbar_position}"
+    density_sigma = {config.density_sigma}
+    
+    # 通用热力图专属配置
+    heatmap_mode = "{config.heatmap_mode}"
+    square_cells = {config.square_cells}
+    center_zero = {config.center_zero}
+    value_format = "{config.value_format}"
+    font_size = {config.font_size}
+    
+    # 显著性箱线图专属配置
+    test_method = "{config.test_method}"
+    show_significance = {config.show_significance}
+    box_width = {config.box_width}
+    point_alpha = {config.point_alpha}
+    jitter_amount = {config.jitter_amount}
+    
+    # 通用箱线图专属配置
+    box_alpha = {config.box_alpha}
+    show_outliers = {config.show_outliers}
+    show_notch = {config.show_notch}
+    show_means = {config.show_means}
+    median_width = {config.median_width}
+    orient = "{config.orient}"
+    
+    # 边际组合图/相关性矩阵图专属配置
+    matrix_style = "{config.matrix_style}"
+    display_mode = "{config.display_mode}"
+    grid_width = {config.grid_width}
+
+# Make config available as global
+CHART_CONFIG = ChartConfig()
+# ========== End Configuration ==========
+
+'''
+    return code
+
+
+@router.post("/run-configured")
+async def run_template_configured(
+    template_id: str = Form(...),
+    config: str = Form("{}"),  # JSON string of ChartConfig
+    files: List[UploadFile] = File(...),
+    current_user: Optional[User] = Depends(get_current_user_optional),
 ):
-    """Execute code with uploaded files"""
-    import json
+    """Run a template with custom chart configuration.
     
-    data_files = {}
-    if data_files_json:
+    - template_id: relative path to the template's main.py
+    - config: JSON string containing ChartConfig fields
+    - files: one or more uploaded data files (.csv/.xlsx/.xls)
+    """
+    if not files:
+        raise HTTPException(status_code=400, detail="No data files uploaded")
+
+    allowed = {".csv", ".xlsx", ".xls"}
+    for f in files:
+        if not f.filename:
+            raise HTTPException(status_code=400, detail="Uploaded file missing filename")
+        ext = Path(f.filename).suffix.lower()
+        if ext not in allowed:
+            raise HTTPException(status_code=400, detail=f"Unsupported file type: {ext}")
+
+    # Parse config
+    try:
+        config_dict = json.loads(config)
+        chart_config = ChartConfig(**config_dict)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid config: {str(e)}")
+
+    # Resolve template path safely
+    main_py = _safe_path_under_root(template_id)
+    if not main_py.exists() or not main_py.is_file() or main_py.name.lower() != "main.py":
+        raise HTTPException(status_code=404, detail="Template main.py not found")
+
+    with tempfile.TemporaryDirectory(prefix="echarts_lab_") as tmpdir:
+        tmp = Path(tmpdir)
+
+        # Read original main.py and remove BOM if present
+        original_code = main_py.read_text(encoding="utf-8-sig")
+        
+        # Prepend config code
+        config_code = _generate_config_code(chart_config)
+        modified_code = config_code + original_code
+        
+        # Write modified main.py without BOM
+        (tmp / "main.py").write_text(modified_code, encoding="utf-8")
+
+        # Save uploaded files into isolated folder (CWD)
+        for uf in files:
+            content = await uf.read()
+            (tmp / uf.filename).write_bytes(content)
+
+        # Also save the config as JSON for templates that want to read it directly
+        (tmp / "_chart_config.json").write_text(json.dumps(config_dict, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        output_path = tmp / "output.png"
+
+        env = os.environ.copy()
+        env["MPLBACKEND"] = "Agg"
+        env["MPLCONFIGDIR"] = str(tmp)
+        env["PYTHONUTF8"] = "1"
+        env.pop("PYTHONHOME", None)
+        env.pop("__PYVENV_LAUNCHER__", None)
+
         try:
-            data_files = json.loads(data_files_json)
-        except:
-            pass
-    
-    request = RunRequest(code=code, template_id=template_id, data_files=data_files)
-    return run_template(request, current_user)
+            proc = subprocess.run(
+                [sys.executable, "main.py"],
+                cwd=str(tmp),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=180,
+            )
+        except subprocess.TimeoutExpired:
+            raise HTTPException(status_code=408, detail="Template execution timed out (180s)")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to start template: {e}")
+
+        if proc.returncode != 0:
+            stderr = (proc.stderr or "").strip()
+            stdout = (proc.stdout or "").strip()
+            msg = stderr or stdout or "Template execution failed"
+            if len(msg) > 4000:
+                msg = msg[:4000] + "..."
+            raise HTTPException(status_code=400, detail=msg)
+
+        if not output_path.exists():
+            pngs = sorted(tmp.glob("*.png"), key=lambda p: p.stat().st_mtime, reverse=True)
+            if pngs:
+                output_path = pngs[0]
+            else:
+                raise HTTPException(
+                    status_code=400,
+                    detail="No output image produced. Expecting output.png.",
+                )
+
+        img = output_path.read_bytes()
+        return Response(content=img, media_type="image/png")

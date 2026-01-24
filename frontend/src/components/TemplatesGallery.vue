@@ -1,57 +1,71 @@
 <script setup lang="ts">
-import { onMounted, ref, computed } from 'vue'
-import api from '../api'
+import { onMounted, ref, computed, watch } from 'vue'
+import { fetchTemplates, runTemplate, type TemplateMeta } from '../api'
 
-interface TemplateInfo {
-  id: string
-  name: string
-  category: string
-  description: string
-  thumbnail: string | null
-  has_data_file: boolean
-  data_files: string[]
-}
-
+// ==================== Emits ====================
 const emit = defineEmits<{
-  (e: 'select', templateId: string): void
+  select: [template: TemplateMeta]
 }>()
 
-const templates = ref<TemplateInfo[]>([])
+// ==================== State ====================
+const templates = ref<TemplateMeta[]>([])
 const loading = ref(false)
 const error = ref('')
 const searchQuery = ref('')
 const selectedCategory = ref<string>('all')
 
+// Runner Modal state
+const showRunnerModal = ref(false)
+const selectedTemplate = ref<TemplateMeta | null>(null)
+const uploadedFile = ref<File | null>(null)
+const isRunning = ref(false)
+const runError = ref('')
+const resultImageUrl = ref<string | null>(null)
+
+// ==================== Computed ====================
 const categories = computed(() => {
   const cats = new Set(templates.value.map(t => t.category))
   return ['all', ...Array.from(cats).sort()]
 })
 
-const filteredTemplates = computed(() => {
-  let result = templates.value
+const templatesByCategory = computed(() => {
+  const map: Record<string, TemplateMeta[]> = {}
   
-  if (selectedCategory.value !== 'all') {
-    result = result.filter(t => t.category === selectedCategory.value)
-  }
-  
+  let filtered = templates.value
   if (searchQuery.value.trim()) {
     const query = searchQuery.value.toLowerCase()
-    result = result.filter(t => 
+    filtered = filtered.filter(t =>
       t.name.toLowerCase().includes(query) ||
       t.category.toLowerCase().includes(query) ||
-      t.description.toLowerCase().includes(query)
+      t.tags.some(tag => tag.toLowerCase().includes(query))
     )
   }
   
-  return result
+  if (selectedCategory.value !== 'all') {
+    filtered = filtered.filter(t => t.category === selectedCategory.value)
+  }
+  
+  for (const t of filtered) {
+    if (!map[t.category]) map[t.category] = []
+    map[t.category].push(t)
+  }
+  
+  return map
 })
 
-async function fetchTemplates() {
+const totalFiltered = computed(() => {
+  return Object.values(templatesByCategory.value).reduce((s, arr) => s + arr.length, 0)
+})
+
+const canRun = computed(() => !!uploadedFile.value && !isRunning.value)
+
+// ==================== Methods ====================
+async function loadTemplates() {
   loading.value = true
   error.value = ''
   try {
-    const { data } = await api.get('/templates')
-    templates.value = data
+    const res = await fetchTemplates()
+    templates.value = res.templates
   } catch (e: any) {
     error.value = e?.response?.data?.detail ?? String(e)
   } finally {
@@ -59,59 +73,122 @@ async function fetchTemplates() {
   }
 }
 
-function getThumbnailUrl(template: TemplateInfo): string {
-  // 如果有缩略图路径，使用图片API
+function getThumbnailUrl(template: TemplateMeta): string {
   if (template.thumbnail) {
-    // 对路径的每个部分分别编码，保留 / 分隔符
     const encodedPath = template.thumbnail.split('/').map(p => encodeURIComponent(p)).join('/')
     return `/api/templates/image/${encodedPath}`
   }
-  // 否则尝试使用默认的thumbnail端点
-  const encodedId = template.id.split('/').map(p => encodeURIComponent(p)).join('/')
-  return `/api/templates/${encodedId}/thumbnail`
-}
-
-function handleThumbnailError(e: Event) {
-  const img = e.target as HTMLImageElement
-  img.style.display = 'none'
-  // 显示占位符
-  const placeholder = img.parentElement?.querySelector('.placeholder-thumb') as HTMLElement
-  if (placeholder) {
-    placeholder.style.display = 'flex'
-  }
+  return ''
 }
 
 function getCategoryColor(category: string): string {
-  // 根据后端按代码推断的图表类型进行配色
   const colors: Record<string, string> = {
     '泰勒图': '#0ea5e9',
-    '色标散点图': '#22c55e',
-    '散点对比图': '#84cc16',
-    '散点图': '#65a30d',
+    '散点图': '#10b981',
     '热力图': '#ef4444',
     '柱状图': '#f59e0b',
     '折线图': '#6366f1',
-    '多曲线': '#8b5cf6',
-    '直方图': '#a855f7',
-    '箱线图': '#fb7185',
+    '曲面图': '#8b5cf6',
+    '箱线图': '#ec4899',
     '小提琴图': '#f472b6',
-    '其他': '#6b7280',
-    // 兼容旧中文分类名称
-    '散点对比图（含色标）': '#22c55e',
-    '散点图（含色标）': '#10b981',
-    '相关性散点矩阵': '#06b6d4',
-    '堆叠柱状图': '#d97706',
-    '曲线对比图': '#8b5cf6'
+    '三元图': '#14b8a6',
+    '气泡图': '#06b6d4',
+    '其他': '#64748b'
   }
-  return colors[category] || '#6b7280'
+  return colors[category] || '#64748b'
 }
 
-onMounted(fetchTemplates)
+function openRunner(template: TemplateMeta) {
+  selectedTemplate.value = template
+  uploadedFile.value = null
+  runError.value = ''
+  if (resultImageUrl.value) {
+    URL.revokeObjectURL(resultImageUrl.value)
+    resultImageUrl.value = null
+  }
+  showRunnerModal.value = true
+}
+
+function closeRunner() {
+  showRunnerModal.value = false
+  selectedTemplate.value = null
+  uploadedFile.value = null
+  runError.value = ''
+  if (resultImageUrl.value) {
+    URL.revokeObjectURL(resultImageUrl.value)
+    resultImageUrl.value = null
+  }
+}
+
+function handleFileChange(e: Event) {
+  const input = e.target as HTMLInputElement
+  if (input.files && input.files.length > 0) {
+    uploadedFile.value = input.files[0]
+  }
+}
+
+function handleDrop(e: DragEvent) {
+  e.preventDefault()
+  if (e.dataTransfer?.files && e.dataTransfer.files.length > 0) {
+    const file = e.dataTransfer.files[0]
+    const ext = file.name.split('.').pop()?.toLowerCase()
+    if (['csv', 'xlsx', 'xls'].includes(ext || '')) {
+      uploadedFile.value = file
+    } else {
+      runError.value = '仅支持 .csv, .xlsx, .xls 格式'
+    }
+  }
+}
+
+function handleDragOver(e: DragEvent) {
+  e.preventDefault()
+}
+
+async function executeRun() {
+  if (!selectedTemplate.value || !uploadedFile.value) return
+  
+  isRunning.value = true
+  runError.value = ''
+  if (resultImageUrl.value) {
+    URL.revokeObjectURL(resultImageUrl.value)
+    resultImageUrl.value = null
+  }
+  
+  try {
+    const blob = await runTemplate(selectedTemplate.value.id, uploadedFile.value)
+    resultImageUrl.value = URL.createObjectURL(blob)
+  } catch (e: any) {
+    // Handle blob error response
+    if (e?.response?.data instanceof Blob) {
+      try {
+        const text = await e.response.data.text()
+        const parsed = JSON.parse(text)
+        runError.value = parsed.detail || '执行失败'
+      } catch {
+        runError.value = '执行失败，无法解析错误信息'
+      }
+    } else {
+      runError.value = e?.response?.data?.detail || e?.message || String(e)
+    }
+  } finally {
+    isRunning.value = false
+  }
+}
+
+function downloadImage() {
+  if (!resultImageUrl.value || !selectedTemplate.value) return
+  const a = document.createElement('a')
+  a.href = resultImageUrl.value
+  a.download = `${selectedTemplate.value.name}_output.png`
+  a.click()
+}
+
+onMounted(loadTemplates)
 </script>
 
 <template>
   <div class="templates-gallery">
-    <!-- 顶部搜索和筛选 -->
+    <!-- Header -->
     <div class="gallery-header">
       <h2>📊 图表模板库</h2>
       <div class="filters">
@@ -129,70 +206,170 @@ onMounted(fetchTemplates)
       </div>
     </div>
 
-    <!-- 加载状态 -->
+    <!-- Loading -->
     <div v-if="loading" class="loading">
       <div class="spinner"></div>
       <span>加载模板中...</span>
     </div>
 
-    <!-- 错误提示 -->
+    <!-- Error -->
     <div v-else-if="error" class="error-box">
       {{ error }}
-      <button @click="fetchTemplates" class="retry-btn">重试</button>
+      <button @click="loadTemplates" class="retry-btn">重试</button>
     </div>
 
-    <!-- 空状态 -->
-    <div v-else-if="filteredTemplates.length === 0" class="empty">
+    <!-- Empty -->
+    <div v-else-if="totalFiltered === 0" class="empty">
       <div class="empty-icon">📭</div>
       <p>没有找到匹配的模板</p>
     </div>
 
-    <!-- 模板网格 -->
-    <div v-else class="templates-grid">
+    <!-- Categorized Grid -->
+    <div v-else class="categories-container">
       <div 
-        v-for="template in filteredTemplates" 
-        :key="template.id"
-        class="template-card"
-        @click="emit('select', template.id)"
+        v-for="(tpls, cat) in templatesByCategory" 
+        :key="cat" 
+        class="category-section"
       >
-        <!-- 缩略图 -->
-        <div class="card-thumbnail">
-          <img 
-            :src="getThumbnailUrl(template)" 
-            :alt="template.name"
-            @load="(e) => { (e.target as HTMLImageElement).style.opacity = '1'; const ph = (e.target as HTMLElement).parentElement?.querySelector('.placeholder-thumb') as HTMLElement; if(ph) ph.style.display = 'none'; }"
-            @error="handleThumbnailError"
-            style="opacity: 0; transition: opacity 0.3s;"
-          />
-          <div class="placeholder-thumb">
-            <span class="chart-icon">📊</span>
-          </div>
-          <!-- 分类标签 -->
+        <h3 class="category-heading">
           <span 
-            class="category-badge" 
-            :style="{ backgroundColor: getCategoryColor(template.category) }"
+            class="category-dot" 
+            :style="{ backgroundColor: getCategoryColor(cat) }"
+          ></span>
+          {{ cat }}
+          <span class="category-count">{{ tpls.length }}</span>
+        </h3>
+        <div class="templates-grid">
+          <div 
+            v-for="template in tpls" 
+            :key="template.id"
+            class="template-card"
+            @click="emit('select', template)"
           >
-            {{ template.category }}
-          </span>
-        </div>
-        
-        <!-- 卡片信息 -->
-        <div class="card-info">
-          <h3 class="card-title" :title="template.name">{{ template.name }}</h3>
-          <p class="card-desc">{{ template.description }}</p>
-          <div class="card-meta">
-            <span v-if="template.has_data_file" class="data-badge">
-              📁 含数据文件
-            </span>
+            <div class="card-thumbnail">
+              <img 
+                v-if="template.thumbnail"
+                :src="getThumbnailUrl(template)" 
+                :alt="template.name"
+                class="thumb-img"
+                @load="(e) => { (e.target as HTMLImageElement).classList.add('loaded'); (e.target as HTMLElement).parentElement?.classList.add('has-image'); }"
+                @error="(e) => { (e.target as HTMLImageElement).style.display = 'none' }"
+              />
+              <div class="placeholder-thumb">
+                <span class="chart-icon">📊</span>
+              </div>
+              <span 
+                class="category-badge" 
+                :style="{ backgroundColor: getCategoryColor(template.category) }"
+              >
+                {{ template.category }}
+              </span>
+            </div>
+            <div class="card-info">
+              <h3 class="card-title" :title="template.name">{{ template.name }}</h3>
+              <div class="card-tags" v-if="template.tags.length">
+                <span v-for="tag in template.tags.slice(0, 2)" :key="tag" class="tag">{{ tag }}</span>
+              </div>
+            </div>
           </div>
         </div>
       </div>
     </div>
 
-    <!-- 统计信息 -->
+    <!-- Footer -->
     <div class="gallery-footer">
-      共 {{ filteredTemplates.length }} 个模板
+      共 {{ totalFiltered }} 个模板
       <span v-if="selectedCategory !== 'all'">（{{ selectedCategory }}）</span>
+    </div>
+
+    <!-- ==================== Runner Modal ==================== -->
+    <div v-if="showRunnerModal" class="modal-overlay" @click.self="closeRunner">
+      <div class="modal-content">
+        <!-- Modal Header -->
+        <div class="modal-header">
+          <h3>🚀 运行模板</h3>
+          <button class="close-btn" @click="closeRunner">✕</button>
+        </div>
+        
+        <!-- Modal Body -->
+        <div class="modal-body">
+          <!-- Template Info -->
+          <div class="template-info-row">
+            <span class="info-label">模板名称：</span>
+            <span class="info-value">{{ selectedTemplate?.name }}</span>
+          </div>
+          <div class="template-info-row">
+            <span class="info-label">分类：</span>
+            <span 
+              class="info-badge" 
+              :style="{ backgroundColor: getCategoryColor(selectedTemplate?.category || '') }"
+            >
+              {{ selectedTemplate?.category }}
+            </span>
+          </div>
+
+          <!-- File Upload Area -->
+          <div 
+            class="upload-zone"
+            :class="{ 'has-file': uploadedFile }"
+            @drop="handleDrop"
+            @dragover="handleDragOver"
+          >
+            <template v-if="!uploadedFile">
+              <div class="upload-icon">📁</div>
+              <p class="upload-text">拖拽文件到此处，或点击选择</p>
+              <p class="upload-hint">支持 .csv, .xlsx, .xls 格式</p>
+              <input 
+                type="file" 
+                accept=".csv,.xlsx,.xls"
+                class="file-input"
+                @change="handleFileChange"
+              />
+            </template>
+            <template v-else>
+              <div class="file-selected">
+                <span class="file-icon">📄</span>
+                <span class="file-name">{{ uploadedFile.name }}</span>
+                <button class="remove-file" @click.stop="uploadedFile = null">✕</button>
+              </div>
+            </template>
+          </div>
+
+          <!-- Run Button -->
+          <button 
+            class="run-btn"
+            :disabled="!canRun"
+            @click="executeRun"
+          >
+            <template v-if="isRunning">
+              <span class="btn-spinner"></span>
+              正在运行...
+            </template>
+            <template v-else>
+              ▶ 运行分析
+            </template>
+          </button>
+
+          <!-- Error Display -->
+          <div v-if="runError" class="run-error">
+            <strong>错误：</strong>
+            <pre>{{ runError }}</pre>
+          </div>
+
+          <!-- Result Image -->
+          <div v-if="resultImageUrl" class="result-section">
+            <div class="result-header">
+              <span>✅ 生成成功</span>
+              <button class="download-btn" @click="downloadImage">
+                ⬇ 下载图片
+              </button>
+            </div>
+            <div class="result-image-container">
+              <img :src="resultImageUrl" alt="生成的图表" />
+            </div>
+          </div>
+        </div>
+      </div>
     </div>
   </div>
 </template>
@@ -208,53 +385,75 @@ onMounted(fetchTemplates)
 }
 
 .gallery-header {
-  padding: 16px 24px;
+  padding: 20px 32px;
   border-bottom: 1px solid #e5e7eb;
   display: flex;
   justify-content: space-between;
   align-items: center;
   flex-wrap: wrap;
-  gap: 12px;
-  background: white;
+  gap: 16px;
+  background: linear-gradient(135deg, #ffffff 0%, #f8fafc 100%);
   flex-shrink: 0;
 }
 
 .gallery-header h2 {
   margin: 0;
-  font-size: 20px;
-  font-weight: 600;
+  font-size: 22px;
+  font-weight: 700;
   color: #1e293b;
 }
 
 .filters {
   display: flex;
-  gap: 10px;
+  gap: 12px;
 }
 
 .search-input {
-  padding: 8px 14px;
-  border: 1px solid #d1d5db;
-  border-radius: 8px;
+  padding: 10px 16px;
+  padding-left: 38px;
+  border: 1px solid #e5e7eb;
+  border-radius: 10px;
   background: white;
   color: #1e293b;
   font-size: 14px;
-  width: 200px;
+  width: 240px;
+  transition: all 0.2s ease;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 24 24' stroke='%239ca3af'%3E%3Cpath stroke-linecap='round' stroke-linejoin='round' stroke-width='2' d='M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: 12px center;
+  background-size: 18px;
 }
 
 .search-input:focus {
   outline: none;
   border-color: #3b82f6;
-  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
+  box-shadow: 0 0 0 4px rgba(59, 130, 246, 0.1);
+}
+
+.search-input::placeholder {
+  color: #9ca3af;
 }
 
 .category-select {
-  padding: 8px 14px;
-  border: 1px solid #d1d5db;
-  border-radius: 8px;
+  padding: 10px 16px;
+  border: 1px solid #e5e7eb;
+  border-radius: 10px;
   background: white;
   color: #1e293b;
   font-size: 14px;
   cursor: pointer;
+  transition: all 0.2s ease;
+  min-width: 130px;
+}
+
+.category-select:hover {
+  border-color: #3b82f6;
+}
+
+.category-select:focus {
+  outline: none;
+  border-color: #3b82f6;
+  box-shadow: 0 0 0 4px rgba(59, 130, 246, 0.1);
 }
 
 .loading {
@@ -315,37 +514,79 @@ onMounted(fetchTemplates)
   margin-bottom: 12px;
 }
 
-.templates-grid {
+/* ==================== Categorized Layout ==================== */
+.categories-container {
   flex: 1;
   overflow-y: auto;
-  padding: 16px 20px;
+  padding: 24px 32px;
+  background: linear-gradient(180deg, #f8fafc 0%, #f1f5f9 100%);
+}
+
+.category-section {
+  margin-bottom: 36px;
+}
+
+.category-section:last-child {
+  margin-bottom: 16px;
+}
+
+.category-heading {
   display: flex;
-  flex-wrap: wrap;
-  gap: 16px;
-  align-content: flex-start;
-  background: #f9fafb;
+  align-items: center;
+  gap: 12px;
+  margin: 0 0 18px 0;
+  font-size: 17px;
+  font-weight: 700;
+  color: #1e293b;
+  padding-bottom: 12px;
+  border-bottom: 2px solid #e5e7eb;
+}
+
+.category-dot {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.15);
+}
+
+.category-count {
+  font-size: 13px;
+  font-weight: 500;
+  color: #6b7280;
+  background: #e5e7eb;
+  padding: 2px 10px;
+  border-radius: 12px;
+  margin-left: auto;
+}
+
+.templates-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 20px;
 }
 
 .template-card {
-  width: calc(33.333% - 11px);
   background: white;
-  border-radius: 12px;
+  border-radius: 14px;
   overflow: hidden;
   cursor: pointer;
-  transition: all 0.2s ease;
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+  transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06), 0 1px 2px rgba(0, 0, 0, 0.04);
+  border: 1px solid #f1f5f9;
 }
 
 .template-card:hover {
-  box-shadow: 0 8px 25px rgba(0, 0, 0, 0.15);
+  transform: translateY(-4px) scale(1.02);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.12), 0 4px 8px rgba(0, 0, 0, 0.08);
+  border-color: #e2e8f0;
 }
 
 .card-thumbnail {
   position: relative;
   width: 100%;
   height: 0;
-  padding-bottom: 56.25%;
-  background: #f3f4f6;
+  padding-bottom: 65%;
+  background: linear-gradient(135deg, #f8fafc 0%, #f1f5f9 100%);
   overflow: hidden;
 }
 
@@ -357,6 +598,17 @@ onMounted(fetchTemplates)
   height: 100%;
   object-fit: contain;
   background: white;
+  opacity: 0;
+  transition: opacity 0.3s ease;
+  z-index: 2;
+}
+
+.card-thumbnail img.loaded {
+  opacity: 1;
+}
+
+.card-thumbnail.has-image .placeholder-thumb {
+  display: none;
 }
 
 .placeholder-thumb {
@@ -368,69 +620,355 @@ onMounted(fetchTemplates)
   display: flex;
   align-items: center;
   justify-content: center;
-  background: linear-gradient(135deg, #f3f4f6, #e5e7eb);
+  background: linear-gradient(135deg, #f8fafc 0%, #e2e8f0 100%);
+  z-index: 1;
 }
 
 .chart-icon {
-  font-size: 72px;
+  font-size: 56px;
   opacity: 0.3;
+  filter: grayscale(30%);
 }
 
 .category-badge {
   position: absolute;
-  top: 12px;
-  left: 12px;
-  padding: 6px 12px;
-  border-radius: 4px;
-  font-size: 13px;
-  font-weight: 500;
+  top: 10px;
+  left: 10px;
+  padding: 5px 12px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 600;
   color: white;
-  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.3);
-  z-index: 10;
+  z-index: 3;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2);
+  backdrop-filter: blur(4px);
+  letter-spacing: 0.3px;
 }
 
 .card-info {
-  padding: 12px 14px;
+  padding: 14px 16px;
+  background: linear-gradient(180deg, #ffffff 0%, #fafbfc 100%);
 }
 
 .card-title {
-  margin: 0 0 4px 0;
+  margin: 0;
   font-size: 14px;
   font-weight: 600;
-  color: #111827;
+  color: #1e293b;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-}
-
-.card-desc {
-  margin: 0 0 6px 0;
-  font-size: 12px;
-  color: #6b7280;
   line-height: 1.4;
-  display: -webkit-box;
-  -webkit-line-clamp: 1;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
 }
 
-.card-meta {
+.card-tags {
   display: flex;
-  gap: 8px;
+  gap: 6px;
+  flex-wrap: wrap;
 }
 
-.data-badge {
-  font-size: 12px;
-  color: #059669;
+.tag {
+  font-size: 11px;
+  padding: 2px 8px;
+  background: #f3f4f6;
+  color: #6b7280;
+  border-radius: 4px;
 }
 
 .gallery-footer {
-  padding: 12px 24px;
+  padding: 14px 32px;
   border-top: 1px solid #e5e7eb;
-  font-size: 14px;
-  color: #6b7280;
+  font-size: 13px;
+  color: #64748b;
   text-align: center;
-  background: white;
+  background: linear-gradient(135deg, #ffffff 0%, #f8fafc 100%);
   flex-shrink: 0;
+  font-weight: 500;
+  letter-spacing: 0.3px;
+}
+
+/* ==================== Modal ==================== */
+.modal-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+  padding: 20px;
+}
+
+.modal-content {
+  background: white;
+  border-radius: 16px;
+  width: 100%;
+  max-width: 600px;
+  max-height: 90vh;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 25px 50px rgba(0, 0, 0, 0.25);
+}
+
+.modal-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 16px 20px;
+  border-bottom: 1px solid #e5e7eb;
+  background: #f9fafb;
+}
+
+.modal-header h3 {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.close-btn {
+  width: 32px;
+  height: 32px;
+  border: none;
+  background: #e5e7eb;
+  border-radius: 50%;
+  font-size: 16px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.2s;
+}
+
+.close-btn:hover {
+  background: #d1d5db;
+}
+
+.modal-body {
+  padding: 20px;
+  overflow-y: auto;
+  flex: 1;
+}
+
+.template-info-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+  font-size: 14px;
+}
+
+.info-label {
+  color: #6b7280;
+}
+
+.info-value {
+  font-weight: 600;
+  color: #111827;
+}
+
+.info-badge {
+  padding: 3px 10px;
+  border-radius: 4px;
+  font-size: 12px;
+  color: white;
+  font-weight: 500;
+}
+
+/* Upload Zone */
+.upload-zone {
+  margin-top: 16px;
+  border: 2px dashed #d1d5db;
+  border-radius: 12px;
+  padding: 32px 20px;
+  text-align: center;
+  position: relative;
+  transition: all 0.2s;
+  cursor: pointer;
+}
+
+.upload-zone:hover {
+  border-color: #3b82f6;
+  background: #f0f9ff;
+}
+
+.upload-zone.has-file {
+  border-style: solid;
+  border-color: #22c55e;
+  background: #f0fdf4;
+}
+
+.upload-icon {
+  font-size: 40px;
+  margin-bottom: 8px;
+}
+
+.upload-text {
+  margin: 0 0 4px 0;
+  font-size: 14px;
+  font-weight: 500;
+  color: #374151;
+}
+
+.upload-hint {
+  margin: 0;
+  font-size: 12px;
+  color: #9ca3af;
+}
+
+.file-input {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.file-selected {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+}
+
+.file-icon {
+  font-size: 24px;
+}
+
+.file-name {
+  font-weight: 500;
+  color: #059669;
+  max-width: 300px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.remove-file {
+  width: 24px;
+  height: 24px;
+  border: none;
+  background: #dc2626;
+  color: white;
+  border-radius: 50%;
+  font-size: 12px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* Run Button */
+.run-btn {
+  width: 100%;
+  margin-top: 20px;
+  padding: 14px;
+  font-size: 15px;
+  font-weight: 600;
+  color: white;
+  background: linear-gradient(135deg, #3b82f6, #2563eb);
+  border: none;
+  border-radius: 10px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  transition: all 0.2s;
+}
+
+.run-btn:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(59, 130, 246, 0.4);
+}
+
+.run-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn-spinner {
+  width: 18px;
+  height: 18px;
+  border: 2px solid rgba(255, 255, 255, 0.3);
+  border-top-color: white;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+/* Error Display */
+.run-error {
+  margin-top: 16px;
+  padding: 12px;
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  border-radius: 8px;
+  color: #dc2626;
+  font-size: 13px;
+}
+
+.run-error pre {
+  margin: 8px 0 0 0;
+  white-space: pre-wrap;
+  word-break: break-all;
+  font-family: ui-monospace, monospace;
+  font-size: 12px;
+  max-height: 150px;
+  overflow-y: auto;
+}
+
+/* Result Section */
+.result-section {
+  margin-top: 20px;
+  border: 1px solid #d1fae5;
+  border-radius: 12px;
+  overflow: hidden;
+  background: #f0fdf4;
+}
+
+.result-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px 16px;
+  background: #dcfce7;
+  font-weight: 500;
+  color: #166534;
+}
+
+.download-btn {
+  padding: 6px 14px;
+  font-size: 13px;
+  font-weight: 500;
+  color: white;
+  background: #16a34a;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+.download-btn:hover {
+  background: #15803d;
+}
+
+.result-image-container {
+  padding: 16px;
+  background: white;
+  display: flex;
+  justify-content: center;
+}
+
+.result-image-container img {
+  max-width: 100%;
+  max-height: 400px;
+  object-fit: contain;
+  border-radius: 8px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
 }
 </style>
