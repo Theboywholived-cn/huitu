@@ -2,6 +2,8 @@
 import { onMounted, ref, computed, watch } from 'vue'
 import { fetchTemplates, runTemplate, type TemplateMeta } from '../api'
 
+
+
 // ==================== Emits ====================
 const emit = defineEmits<{
   select: [template: TemplateMeta]
@@ -972,3 +974,52 @@ onMounted(loadTemplates)
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
 }
 </style>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
