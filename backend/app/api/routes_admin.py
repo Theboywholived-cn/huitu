@@ -564,3 +564,24 @@ def delete_template(
         raise HTTPException(status_code=500, detail=f"删除失败: {str(e)}")
     
     return {"message": "模板已删除"}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    
