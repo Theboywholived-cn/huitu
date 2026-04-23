@@ -975,19 +975,3 @@ onMounted(loadTemplates)
 }
 </style>
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

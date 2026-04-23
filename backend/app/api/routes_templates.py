@@ -753,25 +753,3 @@ async def run_template_configured(
         img = output_path.read_bytes()
         return Response(content=img, media_type="image/png")
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
