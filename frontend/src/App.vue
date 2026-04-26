@@ -47,6 +47,8 @@ function logout() {
   activeTemplate.value = null
 }
 
+
+
 function openTemplate(template: TemplateMeta) {
   activeTemplate.value = template
   pageMode.value = 'template-edit'
