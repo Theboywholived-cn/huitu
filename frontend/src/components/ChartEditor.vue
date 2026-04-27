@@ -2601,11 +2601,3 @@ function resetZoom() {
 
 
 
-
-
-
-
-
-
-
-
