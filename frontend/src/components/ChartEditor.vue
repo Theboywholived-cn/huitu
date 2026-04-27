@@ -2601,3 +2601,122 @@ function resetZoom() {
 
 
 
+
+
+
+<!-- ==================== 1. 线条样式下拉栏 ==================== -->
+<!--
+<div class="form-group half">
+  <label>线条样式</label>
+  <select v-model="chartConfig.line_style" class="form-select">
+    <option value="solid">实线 ───</option>
+    <option value="dashed">虚线 - - -</option>
+    <option value="dotted">点线 ·····</option>
+    <option v-if="!isMatrixBubbleTemplate" value="dashdot">点划线 -·-·</option>
+    <option v-if="isMatrixBubbleTemplate" value="none">无网格</option>
+  </select>
+</div>
+-->
+
+<!-- ==================== 2. 误差类型下拉栏 ==================== -->
+<!--
+<div class="form-group half">
+  <label>误差类型</label>
+  <select v-model="chartConfig.error_type" class="form-select">
+    <option value="sd">标准差 (SD)</option>
+    <option value="se">标准误 (SE)</option>
+    <option value="ci">置信区间 (95% CI)</option>
+  </select>
+</div>
+-->
+
+<!-- ==================== 3. 子图布局方式下拉栏 ==================== -->
+<!--
+<div class="form-group half">
+  <label>布局方式</label>
+  <select v-model="chartConfig.subplot_layout" class="form-select">
+    <option value="vertical">垂直排列</option>
+    <option value="horizontal">水平排列</option>
+  </select>
+</div>
+-->
+
+<!-- ==================== 4. 三元图模式下拉栏 ==================== -->
+<!--
+<div class="form-group">
+  <label>绑图模式</label>
+  <select v-model="chartConfig.ternary_mode" class="form-select">
+    <option value="group">分组散点（按类别着色）</option>
+    <option value="color">颜色映射（按数值分档）</option>
+  </select>
+</div>
+-->
+
+<!-- ==================== 5. 热力图模式下拉栏 ==================== -->
+<!--
+<div class="form-group half">
+  <label>热力图模式</label>
+  <select v-model="chartConfig.heatmap_mode" class="form-select">
+    <option value="correlation">相关性矩阵</option>
+    <option value="matrix">原始数据矩阵</option>
+  </select>
+</div>
+-->
+
+<!-- ==================== 6. 显著性检验方法下拉栏 ==================== -->
+<!--
+<div class="form-group half">
+  <label>显著性检验方法</label>
+  <select v-model="chartConfig.test_method" class="form-select">
+    <option value="mww">Mann-Whitney U</option>
+    <option value="ttest">t-test</option>
+  </select>
+</div>
+-->
+
+<!-- ==================== 7. 颜色条位置下拉栏（三元密度图） ==================== -->
+<!--
+<div class="form-group half">
+  <label>颜色条位置</label>
+  <select v-model="chartConfig.colorbar_position" class="form-select">
+    <option value="right">右侧（垂直）</option>
+    <option value="bottom">底部（水平）</option>
+  </select>
+</div>
+-->
+
+<!-- ==================== 8. 矩阵样式下拉栏（边际组合图） ==================== -->
+<!--
+<div class="form-group half">
+  <label>矩阵样式</label>
+  <select v-model="chartConfig.matrix_style" class="form-select">
+    <option value="circle">圆形气泡</option>
+    <option value="square">方形气泡</option>
+    <option value="heatmap">热力图</option>
+    <option value="values">纯数值</option>
+  </select>
+</div>
+-->
+
+<!-- ==================== 9. 显示模式下拉栏（边际组合图） ==================== -->
+<!--
+<div class="form-group half">
+  <label>显示模式</label>
+  <select v-model="chartConfig.display_mode" class="form-select">
+    <option value="full">完整矩阵</option>
+    <option value="lower">下三角</option>
+    <option value="upper">上三角</option>
+  </select>
+</div>
+-->
+
+<!-- ==================== 10. 方向下拉栏（通用箱线图） ==================== -->
+<!--
+<div class="form-group half">
+  <label>方向</label>
+  <select v-model="chartConfig.orient" class="form-select">
+    <option value="vertical">垂直</option>
+    <option value="horizontal">水平</option>
+  </select>
+</div>
+-->
