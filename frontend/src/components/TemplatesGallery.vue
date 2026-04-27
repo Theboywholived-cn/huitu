@@ -975,3 +975,25 @@ onMounted(loadTemplates)
 }
 </style>
 
+
+
+
+
+
+<!--
+<div class="gallery-header">
+  <div class="filters">
+    <input
+      v-model="searchQuery"
+      class="search-input"
+      placeholder="搜索模板..."
+    />
+    <select v-model="selectedCategory" class="category-select">
+      <option value="all">全部分类</option>
+      <option v-for="cat in categories.slice(1)" :key="cat" :value="cat">
+        {{ cat }}
+      </option>
+    </select>
+  </div>
+</div>
+-->
