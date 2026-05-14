@@ -26,6 +26,7 @@ const emit = defineEmits<{
   (e: 'back'): void
 }>()
 
+
 const template = ref<TemplateDetail | null>(null)
 const loading = ref(false)
 
